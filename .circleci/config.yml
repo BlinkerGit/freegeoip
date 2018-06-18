@@ -1,0 +1,62 @@
+version: 2
+jobs:
+  build-and-publish:
+    # just docker things
+    docker:
+      # runner image
+      - image: circleci/elixir:1.6
+        environment:
+          BASTION_LOGIN: ubuntu@bastion.blinker.com
+          CONSUL_PORT: 8500
+
+    working_directory: ~/repo
+    steps:
+      - checkout
+
+      - setup_remote_docker:
+          version: 17.05.0-ce
+
+      - run:
+          name: create image tag
+          command: |
+            git fetch --tags
+            export SOURCE_TAG=`git tag --points-at HEAD`
+            if  [ $SOURCE_TAG != "" ]; then
+              echo 'export IMAGE_TAG='$SOURCE_TAG >> $BASH_ENV
+            else
+              export IMAGE_TAG=$(echo "${CIRCLE_BRANCH}-${CIRCLE_BUILD_NUM}" | sed -e "s#/#-#g")
+              echo IMAGE_TAG=${IMAGE_TAG} >> $BASH_ENV
+            fi
+            mkdir -p workspace
+            echo "${IMAGE_TAG}" > workspace/image-tag
+            echo "${CIRCLE_BUILD_NUM}" > workspace/image-build-num
+
+      - persist_to_workspace:
+          root: workspace
+          paths:
+            - image-tag
+            - image-build-num
+
+      - run:
+          name: docker login
+          command: |
+            ssh -o "StrictHostKeyChecking no" -L 127.0.0.1:${CONSUL_PORT}:127.0.0.1:${CONSUL_PORT} -fNM -S ./${CIRCLE_BUILD_NUM}-consul.pid ${BASTION_LOGIN}
+            echo "${CONSUL_PORT}" > ${CIRCLE_BUILD_NUM}-consul.port
+            ssh -o "StrictHostKeyChecking no" -S ./${CIRCLE_BUILD_NUM}-consul.pid -O check ${BASTION_LOGIN}
+            sleep 3
+            curl -s localhost:${CONSUL_PORT}/v1/kv/code.blinker.com/docker/dockercfg?raw > ~/.dockercfg
+
+      - run:
+          name: build image
+          command: docker build -t blinker/${CIRCLE_PROJECT_REPONAME}:${IMAGE_TAG} .
+
+      - run:
+          name: publish image
+          command: docker push blinker/${CIRCLE_PROJECT_REPONAME}:${IMAGE_TAG}
+
+
+workflows:
+  version: 2
+  test-build-deploy:
+    jobs:
+      - build-and-publish
