@@ -1,62 +1,150 @@
 version: 2
 jobs:
-  build-and-publish:
-    # just docker things
+  validate-branch-name:
+    resource_class: small
     docker:
-      # runner image
-      - image: circleci/elixir:1.6
-        environment:
-          BASTION_LOGIN: ubuntu@bastion.blinker.com
-          CONSUL_PORT: 8500
-
-    working_directory: ~/repo
+      - image: circleci/elixir:1.8
     steps:
-      - checkout
-
-      - setup_remote_docker:
-          version: 17.05.0-ce
-
       - run:
-          name: create image tag
+          name: Validate feature environment naming convention
           command: |
-            git fetch --tags
-            export SOURCE_TAG=`git tag --points-at HEAD`
-            if  [ $SOURCE_TAG != "" ]; then
-              echo 'export IMAGE_TAG='$SOURCE_TAG >> $BASH_ENV
-            else
-              export IMAGE_TAG=$(echo "${CIRCLE_BRANCH}-${CIRCLE_BUILD_NUM}" | sed -e "s#/#-#g")
-              echo IMAGE_TAG=${IMAGE_TAG} >> $BASH_ENV
+            if [[ $CIRCLE_BRANCH =~ ^feature/ ]]; then
+              export FEATURE_NAME=$( echo ${CIRCLE_BRANCH} | sed -e 's/.*\///g' )
+              [[ $FEATURE_NAME =~ ^[a-zA-Z0-9-]+$ ]] || (echo "feature names may only contain alphnumeric characters and dashes, yours is '${FEATURE_NAME}'" && exit 1)
             fi
-            mkdir -p workspace
-            echo "${IMAGE_TAG}" > workspace/image-tag
-            echo "${CIRCLE_BUILD_NUM}" > workspace/image-build-num
 
-      - persist_to_workspace:
-          root: workspace
-          paths:
-            - image-tag
-            - image-build-num
 
+  build-and-publish:
+    resource_class: small
+    docker:
+      - image: blinker/gearbox:latest
+        auth:
+          username: blinker
+          password: $DOCKERHUB_PASSWORD
+    steps:
+      - add_ssh_keys:
+          fingerprints:
+            - "87:16:3b:78:68:22:1b:4f:d9:59:08:84:33:34:b6:44"
+      - checkout
+      - setup_remote_docker
       - run:
-          name: docker login
+          name: Set Gearbox environment variables
           command: |
-            ssh -o "StrictHostKeyChecking no" -L 127.0.0.1:${CONSUL_PORT}:127.0.0.1:${CONSUL_PORT} -fNM -S ./${CIRCLE_BUILD_NUM}-consul.pid ${BASTION_LOGIN}
-            echo "${CONSUL_PORT}" > ${CIRCLE_BUILD_NUM}-consul.port
-            ssh -o "StrictHostKeyChecking no" -S ./${CIRCLE_BUILD_NUM}-consul.pid -O check ${BASTION_LOGIN}
-            sleep 3
-            curl -s localhost:${CONSUL_PORT}/v1/kv/code.blinker.com/docker/dockercfg?raw > ~/.dockercfg
-
+            gearbox cicd circle_ci_setup
       - run:
-          name: build image
-          command: docker build -t blinker/${CIRCLE_PROJECT_REPONAME}:${IMAGE_TAG} .
-
+          name: Build Docker image
+          command: |
+            gearbox cicd docker_build_image
       - run:
-          name: publish image
-          command: docker push blinker/${CIRCLE_PROJECT_REPONAME}:${IMAGE_TAG}
+          name: Push Docker image
+          command: |
+            gearbox cicd docker_push_image
 
+  set-catalog:
+    resource_class: small
+    docker:
+      - image: blinker/gearbox:latest
+        auth:
+          username: blinker
+          password: $DOCKERHUB_PASSWORD
+    steps:
+      - add_ssh_keys:
+          fingerprints:
+            - "87:16:3b:78:68:22:1b:4f:d9:59:08:84:33:34:b6:44"
+      - run:
+          name: Set Gearbox environment variables
+          command: |
+            gearbox cicd circle_ci_setup
+      - run:
+          name: Set Docker image tag in catalog
+          command: |
+            gearbox cicd consul_set_catalog_image_tag
+
+  deploy-feature:
+    resource_class: small
+    docker:
+      - image: blinker/gearbox:latest
+        auth:
+          username: blinker
+          password: $DOCKERHUB_PASSWORD
+    steps:
+      - add_ssh_keys:
+          fingerprints:
+            - "87:16:3b:78:68:22:1b:4f:d9:59:08:84:33:34:b6:44"
+      - run:
+          name: Set Gearbox environment variables
+          command: |
+            gearbox cicd circle_ci_setup
+      - run:
+          name: Configure authentication for Docker Hub
+          command: |
+            gearbox cicd consul_kv_get key=code.blinker.com/docker/dockercfg > ~/.dockercfg
+      - run:
+          name: Generate docker-compose.yml
+          command: |
+            gearbox cicd docker_generate_compose
+      - run:
+          name: Deploy feature environment
+          command: |
+            docker stack deploy --compose-file docker-compose.yml --with-registry-auth ${GEARBOX_CICD_BRANCH_NAME}
+
+  deploy-integration:
+    resource_class: small
+    docker:
+      - image: blinker/gearbox:latest
+        auth:
+          username: blinker
+          password: $DOCKERHUB_PASSWORD
+    environment:
+      GEARBOX_ENVIRONMENT: integration
+    steps:
+      - add_ssh_keys:
+          fingerprints:
+            - "87:16:3b:78:68:22:1b:4f:d9:59:08:84:33:34:b6:44"
+      - run:
+          name: Set Gearbox environment variables
+          command: |
+            gearbox cicd circle_ci_setup
+      - run:
+          name: Deploy to integration
+          command: |
+            gearbox cicd nomad_deploy_service
 
 workflows:
   version: 2
   test-build-deploy:
     jobs:
-      - build-and-publish
+      - validate-branch-name:
+          filters:
+            tags:
+              only:
+                - /^v.*/
+      - build-and-publish:
+          filters:
+            tags:
+              only:
+                - /^v.*/
+      - set-catalog:
+          requires:
+            - build-and-publish
+          filters:
+            tags:
+              only:
+                - /^v.*/
+      - deploy-feature:
+          requires:
+            - set-catalog
+          filters:
+            branches:
+              only:
+                - /^feature\/.*/
+      - deploy-integration:
+          requires:
+            - set-catalog
+          filters:
+            branches:
+              only:
+                - integration
+            tags:
+              only:
+                - /^v.*/
