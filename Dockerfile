@@ -1,8 +1,9 @@
-FROM golang:1.9
+FROM golang:1.11
 
 COPY cmd/freegeoip/public /var/www
 
 ADD . /go/src/github.com/apilayer/freegeoip
+ENV GO111MODULE=on
 RUN \
 	cd /go/src/github.com/apilayer/freegeoip/cmd/freegeoip && \
 	go get -d && go install && \
